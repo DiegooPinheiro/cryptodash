@@ -16,6 +16,8 @@ de auto-refresh.
 ```bash
 py -m pip install -r requirements.txt
 
+py -m pip install matplotlib mplfinance pandas
+
 ### Persistência local
 - Um banco SQLite em `data/cryptodash.db` guarda configurações e últimos preços.
 - O app também grava um **snapshot JSON** em `data/prices.json` toda vez que obtém preços (útil como cache ou para inspeção).

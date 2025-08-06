@@ -53,6 +53,10 @@ class Dashboard(tk.Frame):
         self.btn_update = ttk.Button(ctrl_frame, text="Atualizar Preços", command=self.atualizar_precos)
         self.btn_update.pack(side="left", padx=8)
 
+        # Botão para abrir tela de gráficos
+        btn_graph = ttk.Button(ctrl_frame, text="Ver Gráfico", command=self.ir_para_grafico)
+        btn_graph.pack(side="left", padx=8)
+
         # Auto refresh controls
         auto_frame = ttk.Frame(self)
         auto_frame.pack(fill="x", padx=12, pady=(6, 0))
@@ -300,3 +304,6 @@ class Dashboard(tk.Frame):
         coin_id = sel.lower()
         self.controller.selected_coin = coin_id
         self.controller.show_frame("Details")
+
+    def ir_para_grafico(self):
+        self.controller.show_frame("GraphFrame")

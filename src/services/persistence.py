@@ -214,3 +214,4 @@ def import_prices_from_json(path: str) -> List[str]:
 
 # ---------- Inicializa DB ao importar ----------
 init_db()
+# ---------- Fim do arquivo ----------

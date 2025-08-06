@@ -2,6 +2,7 @@
 import tkinter as tk
 from src.ui.dashboard import Dashboard
 from src.ui.details import Details
+from src.ui.graph import GraphFrame  # nova tela de gráficos
 
 
 class App(tk.Tk):
@@ -19,7 +20,8 @@ class App(tk.Tk):
         container.grid_columnconfigure(0, weight=1)
 
         self.frames = {}
-        for F in (Dashboard, Details):
+        # registra todas as telas/Frames da aplicação
+        for F in (Dashboard, Details, GraphFrame):
             frame = F(parent=container, controller=self)
             self.frames[F.__name__] = frame
             frame.grid(row=0, column=0, sticky="nsew")
