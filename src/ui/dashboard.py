@@ -1,16 +1,21 @@
-from src.services import persistence
-from src.services.persistence import DEFAULT_JSON_SNAPSHOT
 # src/ui/dashboard.py
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+"""
+Dashboard do CriptoDash com auto-refresh implementado usando after().
+"""
+
 import threading
 import time
-import os
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
 
 from src.services import coingecko, persistence
 from src.config import DEFAULT_COINS, DEFAULT_FIAT, AUTO_REFRESH_INTERVAL
 
-DEFAULT_INTERVAL = AUTO_REFRESH_INTERVAL
+# tenta importar o caminho do snapshot JSON (opcional)
+try:
+    from src.services.persistence import DEFAULT_JSON_SNAPSHOT  # type: ignore
+except Exception:
+    DEFAULT_JSON_SNAPSHOT = None
 
 
 class Dashboard(tk.Frame):
@@ -20,9 +25,9 @@ class Dashboard(tk.Frame):
 
         # Estado
         self.auto_refresh = tk.BooleanVar(value=False)
-        self.refresh_interval = tk.IntVar(value=DEFAULT_INTERVAL)
-        self._auto_thread = None
-        self._stop_auto = threading.Event()
+        self.refresh_interval = tk.IntVar(value=AUTO_REFRESH_INTERVAL)
+        self._after_id = None  # id retornado por after() para cancelar agendamento
+        self._fetch_in_progress = False  # evita fetchs concorrentes
 
         # Layout
         title = ttk.Label(self, text="CriptoDash — Dashboard", font=("Arial", 18, "bold"))
@@ -32,9 +37,15 @@ class Dashboard(tk.Frame):
         ctrl_frame.pack(pady=6, fill="x", padx=12)
 
         ttk.Label(ctrl_frame, text="Selecionar moeda para detalhes:").pack(side="left", padx=(0, 6))
-        self.coin_box = ttk.Combobox(ctrl_frame, values=[c.capitalize() for c in DEFAULT_COINS], state="readonly", width=18)
+        self.coin_box = ttk.Combobox(
+            ctrl_frame,
+            values=[c.capitalize() for c in DEFAULT_COINS],
+            state="readonly",
+            width=18,
+        )
         self.coin_box.pack(side="left")
-        self.coin_box.current(0)
+        if DEFAULT_COINS:
+            self.coin_box.current(0)
 
         btn_details = ttk.Button(ctrl_frame, text="Ver Detalhes", command=self.ir_para_detalhes)
         btn_details.pack(side="left", padx=8)
@@ -46,18 +57,19 @@ class Dashboard(tk.Frame):
         auto_frame = ttk.Frame(self)
         auto_frame.pack(fill="x", padx=12, pady=(6, 0))
 
-        self.chk_auto = ttk.Checkbutton(auto_frame, text="Auto-refresh", variable=self.auto_refresh, command=self.toggle_auto_refresh)
+        self.chk_auto = ttk.Checkbutton(
+            auto_frame,
+            text="Auto-refresh",
+            variable=self.auto_refresh,
+            command=self._on_toggle_auto_refresh,
+        )
         self.chk_auto.pack(side="left")
 
         ttk.Label(auto_frame, text="Intervalo (s):").pack(side="left", padx=(12, 4))
-        self.interval_slider = ttk.Scale(auto_frame, from_=5, to=300, variable=self.refresh_interval, orient="horizontal")
+        self.interval_slider = ttk.Scale(
+            auto_frame, from_=5, to=300, variable=self.refresh_interval, orient="horizontal"
+        )
         self.interval_slider.pack(side="left", fill="x", expand=True, padx=6)
-
-        # export/import
-       # exp_imp = ttk.Frame(self)
-       # exp_imp.pack(fill="x", padx=12, pady=6)
-       # ttk.Button(exp_imp, text="Exportar JSON", command=self.export_json).pack(side="left")
-       # ttk.Button(exp_imp, text="Importar JSON", command=self.import_json).pack(side="left", padx=6)
 
         # status / loading
         self.status_label = ttk.Label(self, text="", foreground="blue")
@@ -74,12 +86,31 @@ class Dashboard(tk.Frame):
         ttk.Label(header, text="Variação 24h", width=14).pack(side="left")
 
         self.price_labels = {}
-        self.criar_labels()
+        self._build_labels()
 
-        # carregar últimos preços do DB (se houver)
+        # Carrega cache (DB ou JSON)
         self.load_cached_prices()
 
-    def criar_labels(self):
+        # Carrega configurações salvas (se houver) e inicia auto se estava ligado
+        saved_auto = persistence.load_setting("auto_refresh")
+        saved_interval = persistence.load_setting("refresh_interval")
+        if saved_auto is not None:
+            try:
+                self.auto_refresh.set(saved_auto == "1")
+            except Exception:
+                pass
+        if saved_interval is not None:
+            try:
+                self.refresh_interval.set(int(saved_interval))
+            except Exception:
+                pass
+
+        if self.auto_refresh.get():
+            # agenda a primeira execução breve para começar o ciclo
+            self._schedule_next_refresh(delay_ms=500)
+
+    # ---------- UI helpers ----------
+    def _build_labels(self):
         # remove linhas exceto header (primeiro filho)
         children = self.result_frame.winfo_children()
         for w in children[1:]:
@@ -98,30 +129,49 @@ class Dashboard(tk.Frame):
             lbl_change.pack(side="left")
             self.price_labels[coin] = {"usd": lbl_usd, "brl": lbl_brl, "change": lbl_change}
 
+    def _set_status(self, text: str, color: str = "black"):
+        self.status_label.config(text=text, foreground=color)
+
+    def _set_ui_busy(self, busy: bool):
+        self._fetch_in_progress = busy
+        state = "disabled" if busy else "normal"
+        try:
+            self.btn_update.config(state=state)
+        except Exception:
+            pass
+
+    # ---------- Fetch / atualização ----------
     def atualizar_precos(self):
-        self.btn_update.config(state="disabled")
-        self.status_label.config(text="Carregando preços...", foreground="blue")
-        thread = threading.Thread(target=self.buscar_precos, daemon=True)
+        """Inicia fetch em thread (chamado pelo botão)."""
+        if self._fetch_in_progress:
+            return
+        self._set_ui_busy(True)
+        self._set_status("Carregando preços...", "blue")
+        thread = threading.Thread(target=self._fetch_and_apply, daemon=True)
         thread.start()
 
-    def buscar_precos(self):
+    def _fetch_and_apply(self):
+        """Chamada em thread: busca na API e aplica resultados via after()."""
         try:
             data = coingecko.get_prices(DEFAULT_COINS, DEFAULT_FIAT)
-            # salva cada moeda no DB (persistência)
+            # salva snapshot JSON
+            if DEFAULT_JSON_SNAPSHOT:
+                try:
+                    persistence.save_json_snapshot(DEFAULT_JSON_SNAPSHOT, data)
+                except Exception:
+                    pass
+            # salva no DB
             for coin, payload in data.items():
-                persistence.save_price(coin, payload)
-            # ---- novo: salvar snapshot JSON em arquivo do projeto ----
-            try:
-                persistence.save_json_snapshot(DEFAULT_JSON_SNAPSHOT, data)
-            except Exception:
-                # não interrompe a UI se falhar ao salvar o JSON
-                pass
-            self.after(0, self.atualizar_labels, data)
-        except Exception as e:
-            self.after(0, self.mostrar_erro, str(e))
+                try:
+                    persistence.save_price(coin, payload)
+                except Exception:
+                    pass
+            # aplica na UI
+            self.after(0, self._apply_prices, data)
+        except Exception as exc:
+            self.after(0, self._handle_fetch_error, str(exc))
 
-
-    def atualizar_labels(self, data):
+    def _apply_prices(self, data):
         for coin, labels in self.price_labels.items():
             info = data.get(coin, {})
             usd = info.get("usd")
@@ -137,50 +187,85 @@ class Dashboard(tk.Frame):
             else:
                 labels["change"].config(text="--", foreground="black")
 
-        self.status_label.config(text=f"Atualizado em {time.strftime('%H:%M:%S')}", foreground="green")
-        self.btn_update.config(state="normal")
+        self._set_ui_busy(False)
+        # mostra data/hora com segundos
+        self._set_status(f"Atualizado em {time.strftime('%Y-%m-%d %H:%M:%S')}", "green")
 
-    def mostrar_erro(self, mensagem):
-        self.status_label.config(text=f"Erro: {mensagem}", foreground="red")
-        self.btn_update.config(state="normal")
+    def _handle_fetch_error(self, message):
+        self._set_ui_busy(False)
+        self._set_status(f"Erro: {message}", "red")
 
-    # ----------------- Auto-refresh -----------------
-    def toggle_auto_refresh(self):
+    # ---------- Auto-refresh usando after ----------
+    def _on_toggle_auto_refresh(self):
         on = self.auto_refresh.get()
-        persistence.save_setting("auto_refresh", "1" if on else "0")
-        persistence.save_setting("refresh_interval", str(self.refresh_interval.get()))
+        try:
+            persistence.save_setting("auto_refresh", "1" if on else "0")
+            persistence.save_setting("refresh_interval", str(self.refresh_interval.get()))
+        except Exception:
+            pass
+
         if on:
-            self.start_auto_thread()
+            # inicia ciclo: agenda próxima execução (curto delay para iniciar)
+            self._schedule_next_refresh(delay_ms=200)
+            self._set_status("Auto-refresh ligado", "blue")
         else:
-            self.stop_auto_thread()
+            self._cancel_scheduled_refresh()
+            self._set_status("Auto-refresh desligado", "orange")
 
-    def start_auto_thread(self):
-        if self._auto_thread and self._auto_thread.is_alive():
-            return
-        self._stop_auto.clear()
-        self._auto_thread = threading.Thread(target=self._auto_worker, daemon=True)
-        self._auto_thread.start()
-        self.status_label.config(text="Auto-refresh ligado", foreground="blue")
+    def _schedule_next_refresh(self, delay_ms: int | None = None):
+        """Agendar next refresh; cancela agendamento anterior se houver."""
+        if delay_ms is None:
+            delay_ms = max(1, int(self.refresh_interval.get())) * 1000
+        self._cancel_scheduled_refresh()
+        self._after_id = self.after(delay_ms, self._auto_refresh_worker)
 
-    def stop_auto_thread(self):
-        self._stop_auto.set()
-        self.status_label.config(text="Auto-refresh desligado", foreground="orange")
-
-    def _auto_worker(self):
-        # loop até stop flag; respeita o intervalo atual
-        while not self._stop_auto.is_set():
+    def _cancel_scheduled_refresh(self):
+        if self._after_id is not None:
             try:
-                self.buscar_precos()
+                self.after_cancel(self._after_id)
             except Exception:
                 pass
-            interval = int(self.refresh_interval.get()) or DEFAULT_INTERVAL
-            # dormir em pequenos passos para poder interromper mais rápido
-            for _ in range(interval):
-                if self._stop_auto.is_set():
-                    break
-                time.sleep(1)
+            finally:
+                self._after_id = None
 
-    # ----------------- Export / Import -----------------
+    def _auto_refresh_worker(self):
+        """Executa uma atualização e agenda a próxima (é chamado pelo after)."""
+        # evita iniciar se já houver fetch em andamento
+        if self._fetch_in_progress:
+            # re-agenda após pequeno atraso
+            self._schedule_next_refresh(delay_ms=1000)
+            return
+
+        # chama atualização (vai rodar em thread)
+        self.atualizar_precos()
+        # agenda a próxima com base no intervalo atual
+        interval_ms = max(5, int(self.refresh_interval.get())) * 1000
+        self._schedule_next_refresh(delay_ms=interval_ms)
+
+    # ---------- Cache load ----------
+    def load_cached_prices(self):
+        data = {}
+        for coin in DEFAULT_COINS:
+            try:
+                rec = persistence.load_price(coin)
+            except Exception:
+                rec = None
+            if rec and isinstance(rec.get("data"), dict):
+                data[coin] = rec["data"]
+
+        if not data and DEFAULT_JSON_SNAPSHOT:
+            try:
+                snap = persistence.load_json_snapshot(DEFAULT_JSON_SNAPSHOT)
+                if snap and isinstance(snap.get("prices"), dict):
+                    data = snap["prices"]
+            except Exception:
+                data = {}
+
+        if data:
+            # aplica sem mudar status de carregamento
+            self._apply_prices(data)
+
+    # ---------- Export / Import (mantidos por compatibilidade) ----------
     def export_json(self):
         path = filedialog.asksaveasfilename(
             defaultextension=".json",
@@ -206,29 +291,7 @@ class Dashboard(tk.Frame):
         except Exception as e:
             messagebox.showerror("Erro importar", str(e))
 
-    # ----------------- cached load -----------------
-    def load_cached_prices(self):
-        """
-        Carrega do DB os preços salvos e atualiza os labels (útil no startup).
-        Se não houver dados no DB, tenta o snapshot JSON do projeto.
-        """
-        data = {}
-        for coin in DEFAULT_COINS:
-            rec = persistence.load_price(coin)
-            if rec and isinstance(rec.get("data"), dict):
-                data[coin] = rec["data"]
-
-        # se nada no DB, tenta o snapshot JSON
-        if not data:
-            snap = persistence.load_json_snapshot(DEFAULT_JSON_SNAPSHOT)
-            if snap and isinstance(snap.get("prices"), dict):
-                data = snap["prices"]
-
-        if data:
-            self.atualizar_labels(data)
-
-
-    # ----------------- Navegação -----------------
+    # ---------- Navegação ----------
     def ir_para_detalhes(self):
         sel = self.coin_box.get()
         if not sel:
