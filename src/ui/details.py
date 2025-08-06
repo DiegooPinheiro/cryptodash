@@ -1,12 +1,12 @@
-from src.services import persistence
 # src/ui/details.py
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 import threading
 import webbrowser
 from io import BytesIO
+import re
 
-from src.services import coingecko
+from src.services import coingecko, persistence
 from src.config import DEFAULT_FIAT
 
 # tenta usar Pillow para exibir imagem; se não tiver, será opcional
@@ -15,6 +15,34 @@ try:
     PIL_AVAILABLE = True
 except Exception:
     PIL_AVAILABLE = False
+
+
+def _safe_float(value, default=None):
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _format_currency(value, currency="$"):
+    if value is None:
+        return "--"
+    try:
+        # formatação simples com separador de milhares
+        return f"{currency}{value:,.2f}"
+    except Exception:
+        return f"{currency}{value}"
+
+
+def _strip_html_tags(text: str) -> str:
+    """Remove tags HTML básicas e converte múltiplos espaços em um."""
+    if not text:
+        return ""
+    # remover tags simples
+    clean = re.sub(r"<(?:.|\n)*?>", "", text)
+    # colapsar múltiplos espaços/linhas
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean
 
 
 class Details(tk.Frame):
@@ -40,7 +68,7 @@ class Details(tk.Frame):
         info_frame.pack(fill="x", padx=12, pady=6)
         self.price_usd = ttk.Label(info_frame, text="USD: --")
         self.price_usd.pack(anchor="w")
-        self.price_brl = ttk.Label(info_frame, text="BRL: --")
+        self.price_brl = ttk.Label(info_frame, text=f"{DEFAULT_FIAT.upper()}: --")
         self.price_brl.pack(anchor="w")
         self.market_cap = ttk.Label(info_frame, text="Market Cap: --")
         self.market_cap.pack(anchor="w")
@@ -66,9 +94,12 @@ class Details(tk.Frame):
 
         # placeholder para imagem tk
         self._tk_image = None
+        self._image_url = None
+
         # guarda dados da moeda atual
         self.current_data = None
 
+    # ---------------- lifecycle ----------------
     def on_show(self):
         """
         Chamado pelo App.show_frame antes de exibir o frame.
@@ -86,22 +117,37 @@ class Details(tk.Frame):
         thread = threading.Thread(target=self.fetch_details, args=(coin,), daemon=True)
         thread.start()
 
-    def fetch_details(self, coin_id):
+    # ---------------- fetching ----------------
+    def fetch_details(self, coin_id: str):
         try:
             data = coingecko.get_coin_details(coin_id)
+            # opcional: salvar um snapshot simples no DB (estrutura diferente da simple/price)
+            try:
+                # salvar o preço atual no formato usado pelo persistence.save_price (simple payload)
+                market = data.get("market_data", {}) or {}
+                simple_payload = {
+                    "usd": market.get("current_price", {}).get("usd"),
+                    "brl": market.get("current_price", {}).get("brl"),
+                    "usd_24h_change": market.get("price_change_percentage_24h"),
+                }
+                persistence.save_price(coin_id, simple_payload)
+            except Exception:
+                pass
+
             self.after(0, self.populate, data)
-            # salvar em DB simples (opcional): persistence.save_price(coin_id, data)  # note: different structure
         except Exception as e:
             # tentativa de fallback: carregar do cache
-            cached = persistence.load_price(coin_id)
+            try:
+                cached = persistence.load_price(coin_id)
+            except Exception:
+                cached = None
             if cached and cached.get("data"):
-                # cached['data'] pode ser payload simples; não é igual ao /coins/{id} — mas é melhor que nada
                 self.after(0, self.populate_from_cache, cached)
             else:
                 self.after(0, self.show_error, str(e))
 
-
-    def populate(self, data):
+    # ---------------- populate ----------------
+    def populate(self, data: dict):
         """
         Popula a UI com os dados retornados pela API /coins/{id}
         """
@@ -112,13 +158,13 @@ class Details(tk.Frame):
 
         # preços: tenta extrair market_data
         market = data.get("market_data", {}) or {}
-        usd = market.get("current_price", {}).get("usd")
-        brl = market.get("current_price", {}).get("brl")
-        mc = market.get("market_cap", {}).get("usd")
+        usd = _safe_float(market.get("current_price", {}).get("usd"))
+        brl = _safe_float(market.get("current_price", {}).get("brl"))
+        mc = _safe_float(market.get("market_cap", {}).get("usd"))
 
-        self.price_usd.config(text=f"USD: ${usd:,.2f}" if usd else "USD: --")
-        self.price_brl.config(text=f"BRL: R${brl:,.2f}" if brl else "BRL: --")
-        self.market_cap.config(text=f"Market Cap: ${mc:,.2f}" if mc else "Market Cap: --")
+        self.price_usd.config(text=f"USD: {_format_currency(usd, '$')}" if usd is not None else "USD: --")
+        self.price_brl.config(text=f"{DEFAULT_FIAT.upper()}: {_format_currency(brl, 'R$')}" if brl is not None else f"{DEFAULT_FIAT.upper()}: --")
+        self.market_cap.config(text=f"Market Cap: {_format_currency(mc, '$')}" if mc is not None else "Market Cap: --")
 
         # última atualização
         last = data.get("last_updated")
@@ -133,8 +179,7 @@ class Details(tk.Frame):
         else:
             descr = str(desc_field or "")
 
-        # limpa tags HTML simples (opcional). Aqui apenas corta muito longo.
-        descr = descr.strip()
+        descr = _strip_html_tags(descr)
         if len(descr) > 4000:
             descr = descr[:4000] + "... (cortado)"
 
@@ -146,29 +191,15 @@ class Details(tk.Frame):
         # imagem / logo
         image_info = data.get("image", {}) or {}
         img_url = image_info.get("large") or image_info.get("thumb") or image_info.get("small")
+        self._image_url = img_url
         if img_url and PIL_AVAILABLE:
-            # tentar carregar imagem (bloqueante) — pequeno size, está OK
-            try:
-                import requests
-                resp = requests.get(img_url, timeout=10)
-                resp.raise_for_status()
-                img_data = resp.content
-                img = Image.open(BytesIO(img_data))
-                img.thumbnail((120, 120))
-                self._tk_image = ImageTk.PhotoImage(img)
-                self.img_label.config(image=self._tk_image, text="")
-            except Exception:
-                self.img_label.config(image="", text="(imagem não disponível)")
-                self._tk_image = None
+            # buscar imagem em thread para não bloquear a UI
+            threading.Thread(target=self._load_image_thread, args=(img_url,), daemon=True).start()
         else:
-            # sem pillow ou sem url: mostrar texto com link (ou url)
             if img_url:
-                self.img_label.config(image="", text="(imagem: disponível)")
-                # armazenar url para abrir se quiser
-                self._image_url = img_url
+                self.img_label.config(image="", text="(imagem disponível)")
             else:
                 self.img_label.config(image="", text="(sem imagem)")
-                self._image_url = None
 
         # habilita botão homepage se existir
         links = data.get("links", {}) or {}
@@ -182,6 +213,49 @@ class Details(tk.Frame):
 
         self.status_label.config(text="Detalhes carregados.", foreground="green")
 
+    def populate_from_cache(self, cached: dict):
+        """
+        Popula com dados simples vindos do cache (payload salvo via save_price).
+        Exibe preços básicos e informa que é um fallback.
+        """
+        data = cached.get("data", {})
+        usd = _safe_float(data.get("usd"))
+        brl = _safe_float(data.get("brl"))
+        self.name_label.config(text=f"{getattr(self.controller, 'selected_coin', '').capitalize()} (cache)")
+        self.price_usd.config(text=f"USD: {_format_currency(usd, '$')}" if usd is not None else "USD: --")
+        self.price_brl.config(text=f"{DEFAULT_FIAT.upper()}: {_format_currency(brl, 'R$')}" if brl is not None else f"{DEFAULT_FIAT.upper()}: --")
+        self.market_cap.config(text="Market Cap: -- (cache)")
+        self.last_update.config(text=f"Última atualização (cache): {cached.get('timestamp', '--')}")
+        self.desc_area.config(state="normal")
+        self.desc_area.delete("1.0", tk.END)
+        self.desc_area.insert(tk.END, "Dados carregados do cache local.")
+        self.desc_area.config(state="disabled")
+        self.img_label.config(image="", text="(imagem não disponível)")
+        self.status_label.config(text="Mostrando dados do cache.", foreground="orange")
+
+    # ---------------- image loader ----------------
+    def _load_image_thread(self, url: str):
+        """Faz o download da imagem em thread e depois aplica na UI."""
+        try:
+            import requests
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            img_data = resp.content
+            img = Image.open(BytesIO(img_data))
+            img.thumbnail((120, 120))
+            tk_img = ImageTk.PhotoImage(img)
+            # atualizar UI na thread principal
+            def _apply():
+                self._tk_image = tk_img
+                self.img_label.config(image=self._tk_image, text="")
+            self.after(0, _apply)
+        except Exception:
+            def _fail():
+                self.img_label.config(image="", text="(imagem não disponível)")
+                self._tk_image = None
+            self.after(0, _fail)
+
+    # ---------------- links / misc ----------------
     def open_homepage(self):
         if getattr(self, "_homepage", None):
             webbrowser.open(self._homepage)
@@ -195,7 +269,7 @@ class Details(tk.Frame):
     def clear_fields(self):
         self.name_label.config(text="")
         self.price_usd.config(text="USD: --")
-        self.price_brl.config(text="BRL: --")
+        self.price_brl.config(text=f"{DEFAULT_FIAT.upper()}: --")
         self.market_cap.config(text="Market Cap: --")
         self.last_update.config(text="Última atualização: --")
         self.desc_area.config(state="normal")
