@@ -41,7 +41,10 @@ gráficos de candles em tempo quase real.
    ```bash
    pip install requests pillow matplotlib pandas mplfinance
    ```
-
+    ```bash
+   pip install customtkinter
+   ```
+   
 > 💡 **Nota:** No Linux, pode ser necessário instalar o Tkinter via:
 > ```bash
 > sudo apt install python3-tk
